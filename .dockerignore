@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+tests/e2e/fixtures
+test-results
+playwright-report
+*.log
