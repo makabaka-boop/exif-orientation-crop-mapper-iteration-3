@@ -9,6 +9,7 @@ import {
   PixelImage,
   Rect,
   Size,
+  forwardMap,
   inverseMap,
   orientedSize,
 } from './orientation';
@@ -94,6 +95,51 @@ export function mapRectToOriginal(
     y: y0,
     width: Math.max(...xs) - x0 + 1,
     height: Math.max(...ys) - y0 + 1,
+  };
+}
+
+/**
+ * 原图矩形的四角（像素单元）正变换到显示坐标后的对应点。
+ * 与 mapCornersToOriginal 互为反向：这里取原图矩形覆盖的像素单元四角，
+ * 经 forwardMap 得到显示坐标。
+ */
+export function mapCornersToDisplay(
+  rect: Rect,
+  raw: Size,
+  orientation: Orientation,
+): MappedCorner[] {
+  if (!isValidRect(rect, raw)) {
+    throw new Error(`invalid original rect for ${raw.width}x${raw.height} image`);
+  }
+  const cells = [
+    { x: rect.x, y: rect.y },
+    { x: rect.x + rect.width - 1, y: rect.y },
+    { x: rect.x, y: rect.y + rect.height - 1 },
+    { x: rect.x + rect.width - 1, y: rect.y + rect.height - 1 },
+  ];
+  return cells.map(({ x, y }) => { const { u, v } = forwardMap(x, y, raw, orientation); return { u, v, x, y }; });
+}
+
+/**
+ * 原图矩形 → 指定方向下显示图中的半开矩形（四角的轴对齐包围盒）。
+ * 已保存裁片以原图坐标记录，切换方向后必须经此重投影得到显示矩形，
+ * 而不能把旧方向下的显示坐标直接套用到新方向。
+ */
+export function mapRectToDisplay(
+  rect: Rect,
+  raw: Size,
+  orientation: Orientation,
+): Rect {
+  const corners = mapCornersToDisplay(rect, raw, orientation);
+  const us = corners.map((c) => c.u);
+  const vs = corners.map((c) => c.v);
+  const u0 = Math.min(...us);
+  const v0 = Math.min(...vs);
+  return {
+    x: u0,
+    y: v0,
+    width: Math.max(...us) - u0 + 1,
+    height: Math.max(...vs) - v0 + 1,
   };
 }
 

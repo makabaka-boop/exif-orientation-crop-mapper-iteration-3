@@ -15,6 +15,17 @@ import {
   mapRectToOriginal,
   rectFromBounds,
 } from './core/crop';
+import {
+  CropItem,
+  MAX_CROPS,
+  addCropItem,
+  canAddCrop,
+  createCropItem,
+  displayRectForCrop,
+  removeCropItem,
+  validateCropName,
+} from './core/crops';
+import { buildCropPackage } from './core/package';
 
 const ORIENTATION_LABELS: Record<Orientation, string> = {
   1: '1 · 原样',
@@ -34,15 +45,25 @@ const cropRect = ref<Rect | null>(null);
 const dragRect = ref<Rect | null>(null);
 const status = ref('请选择本地 PNG/JPEG 图片。');
 
+/** 多裁片工作区：已保存裁片（区域以原图坐标记录）。 */
+const crops = ref<CropItem[]>([]);
+const cropName = ref('');
+
 /**
  * 代际令牌：图片或方向每次变更都 +1。
  * 异步解码 / 异步导出完成后比对令牌，不一致即丢弃结果，
  * 保证旧解码与旧导出不会覆盖当前状态。
  */
 let generation = 0;
+/** 裁片列表版本：每次增删裁片 +1，打包期间据此发现列表变更。 */
+let cropsVersion = 0;
+/** 裁片 id 计数器：同一批图片内唯一，换图后重置。 */
+let nextCropId = 1;
 let currentFile: File | null = null;
 
 const previewCanvas = ref<HTMLCanvasElement | null>(null);
+/** 预览重渲染节拍：让覆盖层样式在画布尺寸更新后重算。 */
+const renderTick = ref(0);
 let dragging = false;
 let dragAnchor = { x: 0, y: 0 };
 
@@ -88,6 +109,55 @@ const overlayStyle = computed(() => {
   };
 });
 
+/** 裁片名称的校验错误（未输入时不提示，仅禁用保存按钮）。 */
+const cropNameError = computed(() =>
+  cropName.value.trim() ? validateCropName(cropName.value, crops.value) : null,
+);
+
+const canSaveCrop = computed(
+  () =>
+    validCrop.value &&
+    canAddCrop(crops.value) &&
+    validateCropName(cropName.value, crops.value) === null,
+);
+
+/**
+ * 各已保存裁片在当前方向下的显示矩形（id → 重投影结果）。
+ * 切换方向后由计算属性自动重算，绝不沿用旧方向的显示坐标。
+ */
+const savedRects = computed(() => {
+  const img = rawImage.value;
+  const map = new Map<string, Rect>();
+  if (!img) return map;
+  for (const item of crops.value) {
+    map.set(item.id, displayRectForCrop(item, img, orientation.value));
+  }
+  return map;
+});
+
+/** 已保存裁片的画布覆盖层（与批次状态共用同一裁片 id）。 */
+const savedOverlays = computed(() => {
+  void renderTick.value; // 画布重绘后重算比例
+  const canvas = previewCanvas.value;
+  if (!canvas || !rawImage.value || canvas.width === 0) return [];
+  const box = canvas.getBoundingClientRect();
+  const sx = box.width / canvas.width;
+  const sy = box.height / canvas.height;
+  return crops.value.map((item) => {
+    const rect = savedRects.value.get(item.id)!;
+    return {
+      id: item.id,
+      name: item.name,
+      style: {
+        left: `${rect.x * sx}px`,
+        top: `${rect.y * sy}px`,
+        width: `${rect.width * sx}px`,
+        height: `${rect.height * sy}px`,
+      },
+    };
+  });
+});
+
 function invalidatePending(): void {
   generation++;
   cropRect.value = null;
@@ -106,6 +176,9 @@ async function loadFile(file: File): Promise<void> {
   const gen = ++generation;
   cropRect.value = null;
   dragRect.value = null;
+  crops.value = []; // 换图清空旧裁片
+  cropsVersion++;
+  nextCropId = 1;
   rawImage.value = null;
   fileInfo.value = null;
   status.value = '解码中…';
@@ -211,6 +284,7 @@ function renderPreview(): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   ctx.putImageData(new ImageData(oriented.data, oriented.width, oriented.height), 0, 0);
+  renderTick.value++;
 }
 
 function triggerDownload(blob: Blob, filename: string): void {
@@ -258,6 +332,88 @@ async function exportJson(): Promise<void> {
   if (gen !== generation) return;
   triggerDownload(new Blob([json], { type: 'application/json' }), `${baseName()}-crop-o${o}.json`);
   status.value = '已导出包含原图坐标的 JSON。';
+}
+
+/**
+ * 保存当前裁切框为一个裁片：区域立即逆变换为原图坐标记录。
+ * 非法手势（cropRect 无效）不会走到这里，已保存项不会被覆盖。
+ */
+function saveCrop(): void {
+  const img = rawImage.value;
+  const rect = cropRect.value;
+  if (!img || !rect || !validCrop.value) return;
+  if (!canAddCrop(crops.value)) {
+    status.value = `最多保存 ${MAX_CROPS} 个裁片，请先删除再保存。`;
+    return;
+  }
+  const nameError = validateCropName(cropName.value, crops.value);
+  if (nameError) {
+    status.value = `无法保存：${nameError}`;
+    return;
+  }
+  const item = createCropItem(`crop-${nextCropId++}`, cropName.value, rect, img, orientation.value);
+  crops.value = addCropItem(crops.value, item);
+  cropsVersion++;
+  cropName.value = '';
+  status.value = `已保存裁片「${item.name}」（以原图坐标记录，切换方向后自动重投影）。`;
+}
+
+function removeCrop(id: string): void {
+  const item = crops.value.find((it) => it.id === id);
+  if (!item) return;
+  crops.value = removeCropItem(crops.value, id);
+  cropsVersion++;
+  status.value = `已删除裁片「${item.name}」。`;
+}
+
+/** 浏览器端 PNG 编码器：正向裁片像素 → PNG 字节。 */
+async function encodePngBytes(img: PixelImage): Promise<Uint8Array> {
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  canvas.getContext('2d')!.putImageData(new ImageData(img.data, img.width, img.height), 0, 0);
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+  if (!blob) throw new Error('PNG 编码失败');
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+/**
+ * 交付打包：从当前图片、方向与裁片列表快照生成 ZIP。
+ * 生成期间换图/改方向/改裁片（代际或裁片版本变化）或任一编码失败，
+ * 整包不下载。
+ */
+async function exportZip(): Promise<void> {
+  const img = rawImage.value;
+  const info = fileInfo.value;
+  const o = orientation.value;
+  if (!img || !info || crops.value.length === 0) return;
+
+  // 快照：打包只使用这份拷贝，之后的界面变更不影响内容，只会使整包作废。
+  const snapshot = crops.value.map((it) => ({ ...it, rect: { ...it.rect } }));
+  const gen = generation;
+  const ver = cropsVersion;
+  const stale = () => gen !== generation || ver !== cropsVersion;
+
+  status.value = `正在打包 ${snapshot.length} 个裁片…`;
+  const result = await buildCropPackage(img, info, o, snapshot, encodePngBytes, stale);
+  if (!result.ok) {
+    status.value =
+      result.reason === 'stale'
+        ? '打包期间图片、方向或裁片已变更，整包未下载。'
+        : result.reason === 'encode-failed'
+          ? 'PNG 编码失败，整包未下载。'
+          : '裁片列表无效，整包未下载。';
+    return;
+  }
+  if (stale()) {
+    status.value = '打包期间图片、方向或裁片已变更，整包未下载。';
+    return;
+  }
+  triggerDownload(
+    new Blob([result.zip.buffer as ArrayBuffer], { type: 'application/zip' }),
+    `${baseName()}-crops-o${o}.zip`,
+  );
+  status.value = `已导出 ZIP 包（${snapshot.length} 个裁片 + 清单）。`;
 }
 </script>
 
@@ -313,6 +469,15 @@ async function exportJson(): Promise<void> {
           @pointercancel="dragging = false"
         ></canvas>
         <div class="overlay" :style="overlayStyle"></div>
+        <div
+          v-for="ov in savedOverlays"
+          :key="ov.id"
+          class="saved-overlay"
+          :style="ov.style"
+          :data-testid="`saved-overlay-${ov.id}`"
+        >
+          <span class="saved-label">{{ ov.name }}</span>
+        </div>
       </div>
 
       <div class="panels">
@@ -345,6 +510,51 @@ async function exportJson(): Promise<void> {
           <pre data-testid="json-preview">{{ metadataJson || '（无有效裁切）' }}</pre>
         </div>
       </div>
+
+      <section class="workspace">
+        <h2>多裁片工作区（可选）</h2>
+        <p class="hint">
+          以原图坐标保存至多 {{ MAX_CROPS }} 个唯一命名的裁片；切换方向后自动重投影，
+          交付时从同一图片、方向与裁片列表快照打包为一个 ZIP（含逐项清单）。
+        </p>
+        <div class="save-row">
+          <input
+            v-model="cropName"
+            data-testid="crop-name"
+            type="text"
+            placeholder="裁片名称（唯一，用作包内文件名）"
+          />
+          <button data-testid="save-crop" :disabled="!canSaveCrop" @click="saveCrop">
+            保存当前裁片
+          </button>
+          <span data-testid="crop-count">{{ crops.length }}/{{ MAX_CROPS }}</span>
+        </div>
+        <p v-if="cropNameError" data-testid="crop-name-error" class="invalid">
+          {{ cropNameError }}
+        </p>
+        <ul v-if="crops.length" class="crop-list">
+          <li v-for="item in crops" :key="item.id" :data-testid="`crop-item-${item.id}`">
+            <strong>{{ item.name }}</strong>
+            <span :data-testid="`crop-orig-${item.id}`">
+              原图：x={{ item.rect.x }}, y={{ item.rect.y }}, w={{ item.rect.width }}, h={{
+                item.rect.height
+              }}
+            </span>
+            <span :data-testid="`crop-disp-${item.id}`">
+              显示：x={{ savedRects.get(item.id)?.x }}, y={{ savedRects.get(item.id)?.y }}, w={{
+                savedRects.get(item.id)?.width
+              }}, h={{ savedRects.get(item.id)?.height }}
+            </span>
+            <button :data-testid="`remove-crop-${item.id}`" @click="removeCrop(item.id)">
+              删除
+            </button>
+          </li>
+        </ul>
+        <p v-else data-testid="crop-empty">尚未保存裁片。</p>
+        <button data-testid="export-zip" :disabled="crops.length === 0" @click="exportZip">
+          导出 ZIP 包
+        </button>
+      </section>
     </section>
   </main>
 </template>
@@ -406,6 +616,22 @@ canvas {
   pointer-events: none;
   display: none;
 }
+.saved-overlay {
+  position: absolute;
+  border: 1px solid #2d7dff;
+  background: rgba(45, 125, 255, 0.12);
+  pointer-events: none;
+}
+.saved-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-size: 10px;
+  line-height: 1.4;
+  padding: 0 3px;
+  background: #2d7dff;
+  color: #fff;
+}
 .panels {
   display: flex;
   gap: 24px;
@@ -435,5 +661,36 @@ pre {
   font-size: 12px;
   max-height: 260px;
   overflow: auto;
+}
+.workspace {
+  margin-top: 16px;
+  border-top: 1px solid #ddd;
+  padding-top: 8px;
+}
+.save-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.save-row input {
+  padding: 6px 8px;
+  min-width: 240px;
+}
+.crop-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.crop-list li {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  background: #f6f9ff;
+  border-radius: 6px;
 }
 </style>
