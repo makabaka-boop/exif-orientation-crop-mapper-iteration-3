@@ -15,6 +15,21 @@
 - 方向或图片变更会使旧的异步解码与旧导出失效（代际令牌）；非法矩形
   （零面积/越界）保留当前图片，但导出按钮不可用。
 
+## 多裁片工作区与 ZIP 交付
+
+- 把当前有效框选**保存为裁片**：至多 8 个、名称唯一；保存时立即换算为
+  **原始像素坐标**固化（`SavedCrop{id, name, originalRect}`），与方向无关。
+- 切换 EXIF 方向后，已保存裁片按 `mapRectToDisplay` 从原图坐标**重新投影**显示，
+  绝不把旧显示坐标直接套到新方向；换图则清空全部裁片。
+- 非法手势（零面积/越界）不会覆盖已保存裁片。
+- **导出 ZIP**：从同一图片、方向与裁片列表的**快照**打包，包含各裁片的
+  正向无缩放 PNG（`01-名称.png`…）与 `manifest.json` 清单——逐项绑定裁片身份、
+  原图矩形、显示矩形与包内文件名，可据此复核每张 PNG。任一裁片编码失败，
+  或打包期间换图 / 改方向 / 改裁片，**整包不下载**。
+- 核心映射、批次状态、打包与页面预览共享同一裁片身份；相关纯函数在
+  `src/core/batch.ts`（裁片与重投影）、`src/core/delivery.ts`（清单）、
+  `src/core/zip.ts`（零依赖 ZIP 读写），均不依赖 DOM。
+
 ## 方向映射（原图 W×H → 显示图）
 
 | 值 | 含义 | 原图 (x,y) → 显示 (u,v) | 显示尺寸 |
@@ -39,8 +54,8 @@
 ```bash
 npm install
 npm run dev          # 开发服务器
-npm run test:unit    # Vitest：2×3 非对称彩色矩阵逐项验证 8 种方向/逆变换/边界
-npm run test:e2e     # Playwright：选图→裁切→导出，比对预览与下载文件逐像素一致
+npm run test:unit    # Vitest：2×3 非对称彩色矩阵验证 8 种方向/逆变换/重投影/清单/ZIP
+npm run test:e2e     # Playwright：裁切导出逐像素比对、ZIP 交付、迟到编码不交付旧包
 npm run typecheck    # vue-tsc
 npm run build        # 类型检查 + 产出 dist/
 ```
